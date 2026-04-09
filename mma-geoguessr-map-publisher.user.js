@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MMA -> GeoGuessr map publisher
 // @namespace    mma-geoguessr
-// @version      1.0.1
+// @version      1.0.2
 // @match        https://map-making.app/*
 // @match        https://www.geoguessr.com/map-maker*
 // @grant        GM_setValue
@@ -30,20 +30,21 @@
 
     const count = (countHint || '').toString().replace(/[^\d]/g, '');
 
-    t = t.replace(/\b\d[\d,]*\s+locations\s+selected\b/ig, '').trim();
+    // 去掉描述性文案
+    t = t.replace(/\b\d[\d,]*\s+locations?\s+selected\b/ig, '').trim();
+    t = t.replace(/\b\d[\d,]*\s+locations?\b/ig, '').trim();
+
+    // 去掉首尾破折号 / 空格
     t = t.replace(/^[-—–－\s]+|[-—–－\s]+$/g, '').trim();
 
-    if (count) {
-      t = t.replace(new RegExp(`([\\s\\-—–－_/,:;])${count}$`), '');
-      if (t.endsWith(count)) {
-        const prefix = t.slice(0, -count.length);
-        if (prefix && /[A-Za-z\u4e00-\u9fff]/.test(prefix) && !/^\d+$/.test(prefix)) {
-          t = prefix;
-        }
-      }
+    // 如果文本末尾拼上了 count，并且前面还有内容，则删掉末尾 count
+    // 例：20241934 -> 2024（当 count=1934）
+    // 例：gen41934 -> gen4（当 count=1934）
+    if (count && t.endsWith(count) && t.length > count.length) {
+      t = t.slice(0, -count.length).trim();
+      t = t.replace(/^[-—–－\s]+|[-—–－\s]+$/g, '').trim();
     }
 
-    t = t.replace(/^[-—–－\s]+|[-—–－\s]+$/g, '').trim();
     return t;
   }
 
@@ -208,7 +209,6 @@
     const radios = getExportRadios(dialog);
     const selectionRadio = radios[1] || null;
 
-    // 先尽量像真人一样点文字那一行
     if (selectionRow) {
       hardClick(selectionRow);
       await sleep(180);
@@ -216,7 +216,6 @@
       await sleep(180);
     }
 
-    // 再补点第二个 radio
     if (selectionRadio) {
       hardClick(selectionRadio);
       await sleep(180);
@@ -269,73 +268,113 @@
     return hardClick(btn.closest('button') || btn);
   }
 
-function extractTagFromContextTarget(target) {
-  const candidates = [];
-  let el = target;
+  function ownTextOf(el) {
+    if (!el) return '';
 
-  function pushCandidate(raw) {
-    const txt = (raw || '').replace(/\s+/g, ' ').trim();
-    if (!txt) return;
+    return [...el.childNodes]
+      .filter(node => node.nodeType === Node.TEXT_NODE)
+      .map(node => node.textContent || '')
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
 
-    const m = txt.match(/(\d[\d,]*)\s+locations\s+selected/i);
-    if (m && !lastSelectionCount) lastSelectionCount = m[1].replace(/[^\d]/g, '');
+  function extractTagFromContextTarget(target) {
+    const candidates = [];
+    let el = target;
 
-    candidates.push(txt);
+    function pushCandidate(raw) {
+      let txt = (raw || '').replace(/\s+/g, ' ').trim();
+      if (!txt) return;
 
-    // 额外抓：如果文本里包着一层很多破折号，提取中间内容
-    // 例如 ----------------gen4---------------- -> gen4
-    const wrapped = txt.match(/[-—–－]{2,}\s*([^—–－-][\s\S]*?[^—–－-])\s*[-—–－]{2,}/);
-    if (wrapped && wrapped[1]) {
-      candidates.push(wrapped[1].trim());
+      const m = txt.match(/(\d[\d,]*)\s+locations?\s+selected/i);
+      if (m && !lastSelectionCount) {
+        lastSelectionCount = m[1].replace(/[^\d]/g, '');
+      }
+
+      txt = cleanTagText(txt, lastSelectionCount);
+      if (!txt) return;
+
+      if (/remove from all/i.test(txt)) return;
+      if (/rename in selection/i.test(txt)) return;
+      if (/import to geoguessr/i.test(txt)) return;
+      if (txt.toLowerCase() === 'selected_tag') return;
+      if (txt.length > 60) return;
+
+      // 只排除“刚好等于 location count 的数字”
+      // 例如 count=1934 时，1934 不算 tag
+      // 但 2024 这种纯数字 tag 必须保留
+      const count = (lastSelectionCount || '').toString().replace(/[^\d]/g, '');
+      if (count && /^\d+$/.test(txt) && txt === count) return;
+
+      candidates.push(txt);
     }
+
+    for (let i = 0; i < 6 && el; i++, el = el.parentElement) {
+      // 优先抓元素自身第一层纯文字
+      pushCandidate(ownTextOf(el));
+
+      // 再抓完整文本兜底
+      const full = (el.innerText || '').replace(/\s+/g, ' ').trim();
+      pushCandidate(full);
+
+      // 额外处理：----------------gen4----------------
+      const wrapped = full.match(/[-—–－]{2,}\s*([^—–－-][\s\S]*?[^—–－-])\s*[-—–－]{2,}/);
+      if (wrapped && wrapped[1]) {
+        pushCandidate(wrapped[1]);
+      }
+
+      const aria = el.getAttribute?.('aria-label');
+      if (aria) pushCandidate(aria);
+
+      const title = el.getAttribute?.('title');
+      if (title) pushCandidate(title);
+    }
+
+    const unique = [...new Set(candidates)];
+    unique.sort((a, b) => a.length - b.length);
+
+    return unique[0] || 'selected_tag';
   }
-
-  for (let i = 0; i < 6 && el; i++, el = el.parentElement) {
-    pushCandidate(el.innerText || '');
-  }
-
-  const cleaned = candidates
-    .map(t => cleanTagText(t, lastSelectionCount))
-    .filter(t =>
-      t &&
-      t.length <= 40 &&
-      !t.includes('Remove from') &&
-      !t.includes('Rename in') &&
-      t.toLowerCase() !== 'selected_tag'
-    );
-
-  return cleaned[0] || 'selected_tag';
-}
 
   function getReviewFilenameFromPage() {
     const label = all('div, span, p, strong, b').find(el => textOf(el) === 'Click to add:');
-    if (!label) return cleanTagText(lastTagText || 'selected_tag', lastSelectionCount);
+
+    if (!label) {
+      return cleanTagText(lastTagText || 'selected_tag', lastSelectionCount);
+    }
+
+    const row = label.previousElementSibling;
+    if (!row) {
+      return cleanTagText(lastTagText || 'selected_tag', lastSelectionCount);
+    }
 
     const chips = [];
-    const row = label.previousElementSibling;
+    const count = (lastSelectionCount || '').toString().replace(/[^\d]/g, '');
 
-    if (row) {
-      const directTexts = [...row.childNodes]
-        .map(n => (n.textContent || '').trim())
-        .filter(Boolean);
-      directTexts.forEach(t => chips.push(t));
+    function addChip(raw) {
+      const c = cleanTagText(raw, lastSelectionCount);
+      if (!c) return;
+      if (c.length > 40) return;
+      if (/^click to add:?$/i.test(c)) return;
 
-      all('*', row)
-        .map(el => textOf(el))
-        .filter(Boolean)
-        .forEach(t => chips.push(t));
+      // 只排除“刚好等于 count”的纯数字
+      if (count && /^\d+$/.test(c) && c === count) return;
+
+      if (!chips.includes(c)) chips.push(c);
     }
 
-    const cleaned = [];
-    for (const t of chips) {
-      const c = cleanTagText(t, lastSelectionCount);
-      if (!c) continue;
-      if (c.length > 40) continue;
-      if (c === 'Click to add:') continue;
-      if (!cleaned.includes(c)) cleaned.push(c);
+    for (const child of row.children) {
+      addChip(ownTextOf(child));
+      addChip(child.getAttribute?.('aria-label') || '');
+      addChip(child.getAttribute?.('title') || '');
     }
 
-    if (cleaned.length) return cleaned.join(' + ');
+    if (!chips.length) {
+      addChip(ownTextOf(row));
+    }
+
+    if (chips.length) return chips.join(' + ');
     return cleanTagText(lastTagText || 'selected_tag', lastSelectionCount);
   }
 
@@ -380,7 +419,6 @@ function extractTagFromContextTarget(target) {
     setExportFilename(mapName);
     await sleep(200);
 
-    // 点 Download 前再锁一次，防止假切换
     const locked2 = await ensureSelectionLocked();
     if (!locked2) {
       alert('点 Download 前，Export selection 没锁住。');
@@ -395,7 +433,6 @@ function extractTagFromContextTarget(target) {
       return;
     }
 
-    // 你手动点 Save；保存框关掉后，当前页自动跳 GG
     const startedAt = Date.now();
     const timer = setInterval(() => {
       const focused = document.hasFocus();
