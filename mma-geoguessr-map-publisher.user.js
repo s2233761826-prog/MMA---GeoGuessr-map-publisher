@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MMA -> GeoGuessr map publisher
 // @namespace    mma-geoguessr
-// @version      1.0.0
+// @version      1.0.1
 // @match        https://map-making.app/*
 // @match        https://www.geoguessr.com/map-maker*
 // @grant        GM_setValue
@@ -18,18 +18,33 @@
   const STORE_KEY_DONE = 'mma_import_done';
 
   let lastTagText = null;
+  let lastSelectionCount = null;
 
   function textOf(el) {
     return (el?.innerText || el?.textContent || '').trim();
   }
 
-  function cleanTagText(text) {
-    return (text || '')
-      .replace(/\s[\d,]+$/, '')
-      .replace(/\d+ locations selected$/i, '')
-      .replace(/\d+$/, '')
-      .replace(/^[\-\s]+|[\-\s]+$/g, '')
-      .trim();
+  function cleanTagText(text, countHint = null) {
+    let t = (text || '').replace(/\s+/g, ' ').trim();
+    if (!t) return '';
+
+    const count = (countHint || '').toString().replace(/[^\d]/g, '');
+
+    t = t.replace(/\b\d[\d,]*\s+locations\s+selected\b/ig, '').trim();
+    t = t.replace(/^[-—–－\s]+|[-—–－\s]+$/g, '').trim();
+
+    if (count) {
+      t = t.replace(new RegExp(`([\\s\\-—–－_/,:;])${count}$`), '');
+      if (t.endsWith(count)) {
+        const prefix = t.slice(0, -count.length);
+        if (prefix && /[A-Za-z\u4e00-\u9fff]/.test(prefix) && !/^\d+$/.test(prefix)) {
+          t = prefix;
+        }
+      }
+    }
+
+    t = t.replace(/^[-—–－\s]+|[-—–－\s]+$/g, '').trim();
+    return t;
   }
 
   function safeFilename(name) {
@@ -254,33 +269,47 @@
     return hardClick(btn.closest('button') || btn);
   }
 
-  function extractTagFromContextTarget(target) {
-    const candidates = [];
-    let el = target;
+function extractTagFromContextTarget(target) {
+  const candidates = [];
+  let el = target;
 
-    for (let i = 0; i < 6 && el; i++, el = el.parentElement) {
-      const txt = (el.innerText || '').replace(/\s+/g, ' ').trim();
-      if (!txt) continue;
-      candidates.push(txt);
+  function pushCandidate(raw) {
+    const txt = (raw || '').replace(/\s+/g, ' ').trim();
+    if (!txt) return;
+
+    const m = txt.match(/(\d[\d,]*)\s+locations\s+selected/i);
+    if (m && !lastSelectionCount) lastSelectionCount = m[1].replace(/[^\d]/g, '');
+
+    candidates.push(txt);
+
+    // 额外抓：如果文本里包着一层很多破折号，提取中间内容
+    // 例如 ----------------gen4---------------- -> gen4
+    const wrapped = txt.match(/[-—–－]{2,}\s*([^—–－-][\s\S]*?[^—–－-])\s*[-—–－]{2,}/);
+    if (wrapped && wrapped[1]) {
+      candidates.push(wrapped[1].trim());
     }
-
-    const cleaned = candidates
-      .map(t => cleanTagText(t))
-      .filter(t =>
-        t &&
-        t.length <= 40 &&
-        !t.includes('Remove from') &&
-        !t.includes('Rename in') &&
-        !/^[-]+.*[-]+$/.test(t) &&
-        !/^gen[34]$/i.test(t)
-      );
-
-    return cleaned[0] || 'selected_tag';
   }
+
+  for (let i = 0; i < 6 && el; i++, el = el.parentElement) {
+    pushCandidate(el.innerText || '');
+  }
+
+  const cleaned = candidates
+    .map(t => cleanTagText(t, lastSelectionCount))
+    .filter(t =>
+      t &&
+      t.length <= 40 &&
+      !t.includes('Remove from') &&
+      !t.includes('Rename in') &&
+      t.toLowerCase() !== 'selected_tag'
+    );
+
+  return cleaned[0] || 'selected_tag';
+}
 
   function getReviewFilenameFromPage() {
     const label = all('div, span, p, strong, b').find(el => textOf(el) === 'Click to add:');
-    if (!label) return cleanTagText(lastTagText || 'selected_tag');
+    if (!label) return cleanTagText(lastTagText || 'selected_tag', lastSelectionCount);
 
     const chips = [];
     const row = label.previousElementSibling;
@@ -299,16 +328,15 @@
 
     const cleaned = [];
     for (const t of chips) {
-      const c = cleanTagText(t);
+      const c = cleanTagText(t, lastSelectionCount);
       if (!c) continue;
       if (c.length > 40) continue;
-      if (c === 'gen4' || c === 'gen3') continue;
       if (c === 'Click to add:') continue;
       if (!cleaned.includes(c)) cleaned.push(c);
     }
 
     if (cleaned.length) return cleaned.join(' + ');
-    return cleanTagText(lastTagText || 'selected_tag');
+    return cleanTagText(lastTagText || 'selected_tag', lastSelectionCount);
   }
 
   async function runMMAFlow() {
@@ -322,8 +350,7 @@
 
     await sleep(900);
 
-    const mapName = getReviewFilenameFromPage();
-    GM_setValue(STORE_KEY_NAME, mapName);
+    const tagName = getReviewFilenameFromPage();
 
     if (!clickByExactText('Export')) {
       alert('进入 review 后没找到 Export 按钮。');
@@ -339,6 +366,16 @@
     }
 
     await sleep(200);
+
+    const dialog = findExportDialog();
+    const input = dialog ? dialog.querySelector('input[type="text"]') : null;
+    const defaultName = input ? safeFilename(input.value || '') : '';
+
+    const mapName = defaultName
+      ? (defaultName.toLowerCase().endsWith(tagName.toLowerCase()) ? defaultName : `${defaultName} ${tagName}`)
+      : tagName;
+
+    GM_setValue(STORE_KEY_NAME, mapName);
 
     setExportFilename(mapName);
     await sleep(200);
